@@ -34,6 +34,11 @@ Prefer clear, user-facing instructions and safe, direct fixes. Refer to node nam
 - Do not commit, push, open pull requests, or otherwise publish changes unless explicitly requested.
 - Keep private prompts, images, workflows, credentials, and metadata local unless the user explicitly authorizes sharing or uploading them.
 
+## Workflow Output Naming
+
+- When creating or changing workflow outputs, use `%date:yyyy-MM-dd%/{workflow_or_model+version_name}_%date:yyyyMMdd%` as the filename prefix. Replace the brace-delimited name with the workflow or model name and version; add descriptive suffixes when multiple outputs need distinct names.
+- If the output node does not resolve these placeholders, connect the `Format Path` (`FormatPath`) node from `comfyui_banana_studio` to its filename/path input. Preserve user-edited workflows and output settings.
+
 ## Troubleshooting Approach
 
 1. Identify the user-visible symptom and the intended generation result.
