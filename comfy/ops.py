@@ -304,6 +304,10 @@ def resolve_cast_module_with_vbar(s, dtype, device, bias_dtype, compute_dtype, w
         weight = params[0]
         bias = params[1]
         if prefetch["signature"] is not None:
+            # FIXME: Make this non_gemv_specific.
+            if (isinstance(s, MixedPrecisionOp) and s.comfy_gemv_optimized and isinstance(weight, QuantizedTensor) and not s._full_precision_mm
+                    and s.weight_lowvram_function is None and len(s.weight_function) == 0):
+                weight = weight.optimize_for_gemv(xfer_dest)
             s._v_weight = weight
             s._v_bias = bias
         s._v_signature = prefetch["signature"]
@@ -500,6 +504,7 @@ class CastBiasWeightContext:
 
 class CastWeightBiasOp:
     comfy_cast_weights = False
+    comfy_force_forward = False
     weight_function = []
     bias_function = []
 
@@ -582,20 +587,16 @@ class disable_weight_init:
         def reset_parameters(self):
             return None
 
-        def forward_comfy_cast_weights(self, input, input_act=None, act_weight=None, act_eps=0.0,
-                                       residual=None, residual_scale=None):
+        def forward_comfy_cast_weights(self, input):
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
-                return linear_input_act_(input, weight, bias, input_act, act_weight, act_eps,
-                                         residual, residual_scale)
+                return torch.nn.functional.linear(input, weight, bias)
 
-        def forward(self, input, input_act=None, act_weight=None, residual=None, residual_scale=None):
+        def forward(self, *args, **kwargs):
             run_every_op()
             if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
-                return self.forward_comfy_cast_weights(input, input_act=input_act, act_weight=act_weight,
-                                                       residual=residual, residual_scale=residual_scale)
+                return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
-                return linear_input_act_(input, self.weight, self.bias, input_act, act_weight,
-                                         residual=residual, residual_scale=residual_scale)
+                return super().forward(*args, **kwargs)
 
     class Conv1d(torch.nn.Conv1d, CastWeightBiasOp):
         def reset_parameters(self):
@@ -927,19 +928,17 @@ class fp8_ops(manual_cast):
             self.scale_input = None
             return None
 
-        def forward_comfy_cast_weights(self, input, input_act=None, act_weight=None, act_eps=0.0,
-                                       residual=None, residual_scale=None):
-            input = _eager_input_act(input, input_act, act_weight, act_eps)
+        def forward_comfy_cast_weights(self, input):
             if len(self.weight_function) == 0 and len(self.bias_function) == 0:
                 try:
                     out = fp8_linear(self, input)
                     if out is not None:
-                        return _linear_residual(out, residual, residual_scale)
+                        return out
                 except Exception as e:
                     logging.info("Exception during fp8 op: {}".format(e))
 
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
-                return _linear_residual(torch.nn.functional.linear(input, weight, bias), residual, residual_scale)
+                return torch.nn.functional.linear(input, weight, bias)
 
 CUBLAS_IS_AVAILABLE = False
 try:
@@ -958,14 +957,12 @@ if CUBLAS_IS_AVAILABLE:
                 with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
                     return cublas_half_matmul(input, weight, bias, self._epilogue_str, self.has_bias)
 
-            def forward(self, input, input_act=None, act_weight=None, residual=None, residual_scale=None):
+            def forward(self, *args, **kwargs):
                 run_every_op()
-                input = _eager_input_act(input, input_act, act_weight)
                 if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
-                    out = self.forward_comfy_cast_weights(input)
+                    return self.forward_comfy_cast_weights(*args, **kwargs)
                 else:
-                    out = super().forward(input)
-                return _linear_residual(out, residual, residual_scale)
+                    return super().forward(*args, **kwargs)
 
 # ==============================================================================
 # Mixed Precision Operations
@@ -975,7 +972,6 @@ from .quant_ops import (
     QuantizedTensor,
     QUANT_ALGOS,
     TensorCoreFP8Layout,
-    TensorWiseINT8Layout,
     get_layout_class,
 )
 
@@ -984,9 +980,16 @@ def _swiglu_eager(x):
     return torch.nn.functional.silu(gate).mul_(up)
 
 
+def _situ_eager(x):
+    # out of place: the training path runs through here
+    hidden, gate = x.chunk(2, dim=-1)
+    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))
+
+
 INPUT_ACT_EAGER = {
     "gelu_tanh": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
     "swiglu": _swiglu_eager,
+    "situ": _situ_eager,
 }
 
 
@@ -1022,39 +1025,46 @@ def _fp16_linear_wanted(x):
             and x.dtype == torch.float16 and x.is_cuda)
 
 
+def _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_eps,
+                                   residual, residual_scale):
+    if comfy.model_management.in_training or not isinstance(weight, QuantizedTensor):
+        return NotImplemented
+    with _input_act_weight(x, input_act, act_weight, act_eps) as (act_weight, act_eps):
+        return weight.linear_input_act(
+            x, bias, input_act=input_act, input_act_weight=act_weight, input_act_eps=act_eps,
+            residual=residual, residual_scale=residual_scale,
+        )
+
+
 def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
                      residual=None, residual_scale=None):
     run_every_op()
     weight = linear.weight
     quantized = isinstance(weight, QuantizedTensor)
-    if (comfy.model_management.in_training or getattr(linear, "_full_precision_mm", False)
-            or not ((quantized and weight._layout_cls == "TensorWiseINT8Layout"
-                     and not getattr(weight._params, "transposed", False))
-                    or (not quantized and _fp16_linear_wanted(x)))):
+    if (comfy.model_management.in_training or getattr(linear, "comfy_force_forward", False) or getattr(linear, "_full_precision_mm", False)
+            or not (quantized or _fp16_linear_wanted(x))):
         out = linear(_eager_input_act(x, input_act, act_weight, act_eps))
         return _linear_residual(out, residual, residual_scale)
 
     with CastBiasWeightContext(linear, x, offloadable=True,
                                compute_dtype=x.dtype if quantized else None,
                                want_requant=quantized) as (weight, bias):
-        return linear_input_act_(x, weight, bias, input_act, act_weight, act_eps,
-                                 residual, residual_scale, fp16_accumulation=not quantized)
+        if not quantized:
+            return linear_input_act_(x, weight, bias, input_act, act_weight, act_eps,
+                                     residual, residual_scale)
+        out = _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_eps,
+                                              residual, residual_scale)
+        if out is not NotImplemented:
+            return out
+
+    # A tensor-level fallback cannot replace module-owned input processing.
+    out = linear(_eager_input_act(x, input_act, act_weight, act_eps))
+    return _linear_residual(out, residual, residual_scale)
 
 
 def linear_input_act_(x, weight, bias, input_act=None, act_weight=None, act_eps=0.0,
                       residual=None, residual_scale=None, *, fp16_accumulation=True):
-    """``linear(act(x))``, with ``act`` folded into an INT8 activation quantizer.
-
-    An INT8 linear quantizes its input anyway, so an elementwise activation can
-    ride along inside that kernel instead of writing a full-size intermediate to
-    HBM and reading it straight back. Worth it for an MLP's down-projection,
-    where the intermediate is several times the hidden size, and for a pre-norm
-    block's ``linear(rms_norm(x))`` ("rms_norm", which reads the norm's weight
-    and eps from act_weight/act_eps).
-
-    With ``residual``/``residual_scale`` the result is the pre-norm block's
-    addcmul, ``residual + residual_scale * linear(act(x))``, fused into the
-    INT8 GEMM epilogue where supported.
+    """``linear(act(x))`` with optional residual addcmul, fused where the weight supports it.
 
     Linear weights are already prepared. An RMSNorm module in act_weight owns
     its norm-weight cast context; a tensor uses the supplied act_eps directly.
@@ -1062,29 +1072,18 @@ def linear_input_act_(x, weight, bias, input_act=None, act_weight=None, act_eps=
     if input_act is None and residual is None:
         return torch.nn.functional.linear(x, weight, bias)
 
-    if (comfy.model_management.in_training
-            or not isinstance(weight, QuantizedTensor)
-            or weight._layout_cls != "TensorWiseINT8Layout"
-            or getattr(weight._params, "transposed", False)):
-        x = _eager_input_act(x, input_act, act_weight, act_eps)
-        if (not comfy.model_management.in_training
-                and not isinstance(weight, QuantizedTensor)
-                and fp16_accumulation and _fp16_linear_wanted(x)):
-            return quant_ops.ck.fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
-        return _linear_residual(torch.nn.functional.linear(x, weight, bias), residual, residual_scale)
+    out = _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_eps,
+                                          residual, residual_scale)
+    if out is not NotImplemented:
+        return out
+    x = _eager_input_act(x, input_act, act_weight, act_eps)
 
-    qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
-    with _input_act_weight(x, input_act, act_weight, act_eps) as (act_weight, act_eps):
-        return quant_ops.ck.int8_linear(
-            x, qdata, scale, bias, x.dtype,
-            convrot=getattr(weight._params, "convrot", False),
-            convrot_groupsize=getattr(weight._params, "convrot_groupsize", 256),
-            input_act=input_act,
-            input_act_weight=act_weight,
-            input_act_eps=act_eps,
-            residual=residual,
-            residual_scale=residual_scale,
-        )
+    if (not comfy.model_management.in_training
+            and not isinstance(weight, QuantizedTensor)
+            and fp16_accumulation and _fp16_linear_wanted(x)):
+        return quant_ops.ck.fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
+
+    return _linear_residual(torch.nn.functional.linear(x, weight, bias), residual, residual_scale)
 
 
 # Grouped-scale integer weights that run through the shared INT8 GEMM (comfy_kitchen
@@ -1397,6 +1396,10 @@ def _quantized_weight_state_dict(module, sd, prefix, extra_quant_conf=None, extr
 
 class MixedPrecisionOp(CastWeightBiasOp):
     quant_format = None
+    # Prefer small-M execution; Kitchen owns the layout and preserves GEMM support.
+    # Keep opt-in until extensive testing allows unconditional relayout and a single
+    # resident layout/kernel path instead of parallel canonical and packed paths.
+    comfy_gemv_optimized = False
 
     def can_use_quantized_matmul(self, disabled_formats):
         return (self.quant_format in QUANT_ALGOS
@@ -1451,11 +1454,6 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 compute_dtype=None,
                 want_requant=False,
                 weight_only_quant=False,
-                *,
-                input_act=None,
-                act_weight=None,
-                residual=None,
-                residual_scale=None,
             ):
                 if not weight_only_quant:
                     with CastBiasWeightContext(
@@ -1467,10 +1465,6 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     ) as (weight, bias):
                         if self._full_precision_mm and isinstance(weight, QuantizedTensor):
                             weight = weight.dequantize()
-                        if input_act is not None or residual is not None:
-                            return linear_input_act_(input, weight, bias, input_act, act_weight,
-                                                     residual=residual, residual_scale=residual_scale,
-                                                     fp16_accumulation=not isinstance(self.weight, QuantizedTensor))
                         return self._forward(input, weight, bias)
 
                 with CastBiasWeightContext(
@@ -1486,18 +1480,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     weight = weight.to(dtype=input.dtype)
                     return self._forward(input, weight, bias)
 
-            def forward(self, input, input_act=None, act_weight=None, residual=None, residual_scale=None):
+            def forward(self, input, *args, **kwargs):
                 run_every_op()
-                if input_act is not None or residual is not None:
-                    quantized = isinstance(self.weight, QuantizedTensor)
-                    if (not comfy.model_management.in_training and not self._full_precision_mm
-                            and ((quantized and self.weight._layout_cls == "TensorWiseINT8Layout"
-                                  and not getattr(self.weight._params, "transposed", False))
-                                 or (not quantized and _fp16_linear_wanted(input)))):
-                        return self.forward_comfy_cast_weights(input, compute_dtype=input.dtype, want_requant=quantized,
-                                                               input_act=input_act, act_weight=act_weight,
-                                                               residual=residual, residual_scale=residual_scale)
-                    input = _eager_input_act(input, input_act, act_weight)
 
                 # ModelOpt AWQ-style smoothing
                 pre_quant_scale = getattr(self, 'pre_quant_scale', None)
@@ -1530,10 +1514,9 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         if scale is not None:
                             scale = comfy.model_management.cast_to_device(scale, input.device, None)
 
-                        output = QuantLinearFunc.apply(
+                        return QuantLinearFunc.apply(
                             input, weight, bias, self.layout_type, scale, compute_dtype
                         )
-                        return _linear_residual(output, residual, residual_scale)
 
                 # Inference path (unchanged)
                 if _use_quantized and quantize_input:
@@ -1562,7 +1545,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 if reshaped_nd:
                     output = output.reshape((*input_shape[:-1], self.weight.shape[0]))
 
-                return _linear_residual(output, residual, residual_scale)
+                return output
 
             def convert_weight(self, weight, inplace=False, **kwargs):
                 if isinstance(weight, QuantizedTensor):
